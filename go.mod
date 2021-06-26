@@ -3,10 +3,15 @@ module github.com/tamalsaha/kubeform-installer-generator
 go 1.16
 
 require (
+	github.com/spf13/cobra v1.1.3
 	github.com/spf13/pflag v1.0.5
+	helm.sh/helm/v3 v3.4.1
 	k8s.io/apiextensions-apiserver v0.21.1
 	k8s.io/apimachinery v0.21.1
 	kmodules.xyz/client-go v0.0.0-20210617233340-13d22e91512b
+	kmodules.xyz/resource-metadata v0.5.7
+	kubepack.dev/chart-doc-gen v0.4.0
+	kubepack.dev/lib-app v0.0.4
 	sigs.k8s.io/yaml v1.2.0
 )
 
