@@ -21,12 +21,16 @@ import (
 	goflag "flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"io/ioutil"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
+	"text/template"
 
+	"github.com/Masterminds/sprig/v3"
 	meta_util "kmodules.xyz/client-go/meta"
 	"kmodules.xyz/client-go/tools/parser"
 
@@ -57,92 +61,367 @@ go run main.go --input=/home/tamal/go/src/sigs.k8s.io/application/config/crd/bas
 */
 
 var (
-	crdstore = map[schema.GroupKind]map[string]*unstructured.Unstructured{}
-	empty    = struct{}{}
-
-	allowedGroups = sets.NewString()
-	allowedGKs    = map[schema.GroupKind]struct{}{}
+	crdstore   = map[schema.GroupKind]map[string]*unstructured.Unstructured{}
+	extrastore = map[schema.GroupKind]map[string]*unstructured.Unstructured{}
+	empty      = struct{}{}
 )
 
-func main() {
-	var input []string
-	var out string
-	var outputYAML string
-	var crdVersion = "v1"
-	var gks []string
-	var groups []string
+/*
+.Providers    > lower
+.Provider ====> lower
+.Groups   > full group
+.GIDs     > group prefix (lower)
+.GID =====> lower
+*/
 
-	flag.StringSliceVar(&input, "input", input, "List of crd urls or dir/files")
-	flag.StringVar(&out, "out", out, "Directory where files to be stored")
-	flag.StringVar(&outputYAML, "output-yaml", outputYAML, "Output a single YAML filename")
+type ProviderList struct {
+	Providers []string
+}
+
+var providerList ProviderList
+
+type ProviderData struct {
+	Provider string
+	Groups   []string
+	GIDs     []string
+}
+
+type ProviderGroupData struct {
+	ProviderData
+	GID string
+}
+
+func main() {
+	var providers []string
+	var provider string
+	var gid string
+	var inputDir string
+	var extraInput []string
+	var crdVersion = "v1"
+
+	flag.StringSliceVar(&providers, "providers", providers, "List of providers")
+	flag.StringVar(&provider, "provider", provider, "Provider to be processed, if empty process all providers")
+	flag.StringVar(&gid, "group-id", gid, "Only process group id for --provider if set")
+	flag.StringVar(&inputDir, "input-dir", inputDir, "Directory which contains provider-***-api directories")
+	flag.StringSliceVar(&extraInput, "extra-input", extraInput, "List of extra crd urls or dir/files")
 	flag.StringVar(&crdVersion, "v", crdVersion, "CRD version v1/v1beta1")
-	flag.StringSliceVarP(&groups, "group", "g", groups, "List of groups to import")
-	flag.StringSliceVar(&gks, "gk", gks, "List of kind.group to import")
 	flag.CommandLine.AddGoFlagSet(goflag.CommandLine)
 	flag.Parse()
 
-	allowedGroups.Insert(groups...)
-
-	for _, gk := range gks {
-		allowedGKs[schema.ParseGroupKind(gk)] = empty
-	}
-
-	err := os.MkdirAll(out, 0755)
-	if err != nil {
-		panic(err)
-	}
-
-	for _, location := range input {
-		err := processLocation(location)
+	for _, location := range extraInput {
+		err := processLocation(location, extrastore)
 		if err != nil {
 			panic(err)
 		}
+	}
+
+	strset := sets.NewString()
+	for _, p := range providers {
+		strset.Insert(strings.ToLower(strings.TrimSpace(p)))
+	}
+	providerList = ProviderList{
+		Providers: strset.List(),
+	}
+	provider = strings.ToLower(strings.TrimSpace(provider))
+
+	providersToProcess := strset.List()
+	if provider != "" {
+		providersToProcess = []string{provider}
+	}
+
+	for _, p := range providersToProcess {
+		err := processProvider(inputDir, p, gid, crdVersion)
+		if err != nil {
+			panic(err)
+		}
+	}
+}
+
+func processProvider(inputDir string, p, gid, crdVersion string) error {
+	crdstore = map[schema.GroupKind]map[string]*unstructured.Unstructured{} // reset crd store
+
+	location := filepath.Join(inputDir, fmt.Sprintf("provider-%s-api", p), "crds")
+	err := processLocation(location, crdstore)
+	if err != nil {
+		return err
+	}
+
+	groups := sets.NewString()
+	gids := sets.NewString()
+	for gk := range crdstore {
+		groups.Insert(gk.Group)
+		gids.Insert(gk.Group[0:strings.IndexRune(gk.Group, '.')])
+	}
+
+	err = os.MkdirAll(filepath.Join(inputDir, "installer", "charts", fmt.Sprintf("kubeform-provider-%s", p)), 0755)
+	if err != nil {
+		return err
 	}
 
 	var buf bytes.Buffer
-	for gk := range crdstore {
-		if allowed(gk) {
-			data, filename, err := WriteCRD(out, gk, crdVersion)
-			if err != nil {
-				panic(err)
-			}
-			if outputYAML != "" {
-				if buf.Len() > 0 {
-					buf.WriteString("\n---\n")
-				}
-				buf.Write(data)
-			} else {
-				err = ioutil.WriteFile(filename, data, 0644)
-				if err != nil {
-					panic(err)
-				}
-			}
-		}
-	}
 
-	if outputYAML != "" {
-		err = ioutil.WriteFile(filepath.Join(out, outputYAML), buf.Bytes(), 0644)
+	// installer/.generator/apis/installer/v1alpha1/register.go
+	root := filepath.Join(inputDir, "installer", ".generator", "apis")
+	err = filepath.Walk(root, func(path string, info fs.FileInfo, err error) error {
 		if err != nil {
-			panic(err)
+			return err
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		fmt.Println(rel)
+
+		/*
+			.
+			installer
+			installer/fuzzer
+			installer/fuzzer/fuzzer.go
+			installer/v1alpha1
+			installer/v1alpha1/kubeform_provider_p.go
+			installer/v1alpha1/register.go
+			installer/v1alpha1/types_test.go
+		*/
+
+		if info.IsDir() {
+			return os.MkdirAll(filepath.Join(inputDir, "installer", "apis", rel), 0755)
+		}
+
+		switch rel {
+		case "installer/v1alpha1/kubeform_provider_p.go":
+			tpl := template.Must(template.New("").Funcs(sprig.TxtFuncMap()).ParseFiles(path))
+			buf.Reset()
+			err = tpl.ExecuteTemplate(&buf, filepath.Base(path), ProviderData{
+				Provider: p,
+				Groups:   groups.List(),
+				GIDs:     gids.List(),
+			})
+			if err != nil {
+				return err
+			}
+			return ioutil.WriteFile(filepath.Join(inputDir, "installer", "apis", filepath.Dir(rel), fmt.Sprintf("kubeform_provider_%s.go", p)), buf.Bytes(), 0644)
+		default:
+			tpl := template.Must(template.New("").Funcs(sprig.TxtFuncMap()).ParseFiles(path))
+			buf.Reset()
+			err = tpl.ExecuteTemplate(&buf, filepath.Base(path), providerList)
+			if err != nil {
+				return err
+			}
+			return ioutil.WriteFile(filepath.Join(inputDir, "installer", "apis", rel), buf.Bytes(), 0644)
+		}
+	})
+	if err != nil {
+		return err
+	}
+
+	// installer/.generator/charts/kubeform-provider-p
+	root = filepath.Join(inputDir, "installer", ".generator", "charts", "kubeform-provider-p")
+	err = filepath.Walk(root, func(path string, info fs.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		fmt.Println(rel)
+
+		/*
+			.
+			.helmignore
+			Chart.yaml
+			ci
+			ci/ci-values.yaml
+			doc.yaml
+			templates
+			templates/NOTES.txt
+			templates/user-roles.yaml
+			values.yaml
+		*/
+
+		if info.IsDir() {
+			return os.MkdirAll(filepath.Join(inputDir, "installer", "charts", fmt.Sprintf("kubeform-provider-%s", p), rel), 0755)
+		}
+
+		tpl := template.Must(template.New("").Funcs(sprig.TxtFuncMap()).ParseFiles(path))
+		buf.Reset()
+		err = tpl.ExecuteTemplate(&buf, filepath.Base(path), ProviderData{
+			Provider: p,
+			Groups:   groups.List(),
+			GIDs:     gids.List(),
+		})
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(inputDir, "installer", "charts", fmt.Sprintf("kubeform-provider-%s", p), rel)
+		if rel == "Chart.yaml" {
+			if _, e2 := os.Stat(target); !os.IsNotExist(e2) {
+				// keep original version, appversion
+
+				var existing map[string]interface{}
+				data, err := ioutil.ReadFile(target)
+				if err != nil {
+					return err
+				}
+				err = yaml.Unmarshal(data, &existing)
+				if err != nil {
+					return err
+				}
+
+				var nu map[string]interface{}
+				err = yaml.Unmarshal(buf.Bytes(), &nu)
+				if err != nil {
+					return err
+				}
+				if v, ok := existing["version"]; ok && v.(string) != "" {
+					nu["version"] = v
+				}
+				if v, ok := existing["appVersion"]; ok && v.(string) != "" {
+					nu["appVersion"] = v
+				}
+				data, err = yaml.Marshal(nu)
+				if err != nil {
+					return err
+				}
+				buf.Reset()
+				buf.Write(data)
+			}
+		}
+		return ioutil.WriteFile(target, buf.Bytes(), 0644)
+	})
+	if err != nil {
+		return err
+	}
+
+	// installer/.generator/charts/kubeform-provider-p-g-crds
+
+	gidsToProcess := gids.List()
+	if gid != "" {
+		gidsToProcess = []string{gid}
+	}
+	for _, g := range gidsToProcess {
+		//err = os.MkdirAll(filepath.Join(inputDir, "installer", "charts", fmt.Sprintf("kubeform-provider-%s-%s-crds", p, g)), 0755)
+		//if err != nil {
+		//	return err
+		//}
+
+		root = filepath.Join(inputDir, "installer", ".generator", "charts", "kubeform-provider-p-g-crds")
+		err = filepath.Walk(root, func(path string, info fs.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			rel, err := filepath.Rel(root, path)
+			if err != nil {
+				return err
+			}
+			fmt.Println(rel)
+
+			/*
+				.
+				.helmignore
+				Chart.yaml
+				crds
+				crds/metrics.appscode.com_metricsconfigurations.yaml
+				doc.yaml
+				templates
+				templates/NOTES.txt
+				templates/metrics-user-roles.yaml
+				values.yaml
+			*/
+
+			if info.IsDir() {
+				target := filepath.Join(inputDir, "installer", "charts", fmt.Sprintf("kubeform-provider-%s-%s-crds", p, g), rel)
+				err = os.MkdirAll(target, 0755)
+				if err != nil {
+					return err
+				}
+				if rel == "crds" {
+					// crds
+					for gk := range extrastore {
+						if !strings.HasPrefix(gk.Group, g+".") {
+							continue
+						}
+						data, filename, err := WriteCRD(extrastore, target, gk, crdVersion)
+						if err != nil {
+							panic(err)
+						}
+						err = ioutil.WriteFile(filename, data, 0644)
+						if err != nil {
+							panic(err)
+						}
+					}
+					for gk := range extrastore {
+						data, filename, err := WriteCRD(extrastore, target, gk, crdVersion)
+						if err != nil {
+							panic(err)
+						}
+						err = ioutil.WriteFile(filename, data, 0644)
+						if err != nil {
+							panic(err)
+						}
+					}
+				}
+			}
+
+			tpl := template.Must(template.New("").Funcs(sprig.TxtFuncMap()).ParseFiles(path))
+			buf.Reset()
+			err = tpl.ExecuteTemplate(&buf, filepath.Base(path), ProviderGroupData{
+				ProviderData: ProviderData{
+					Provider: p,
+					Groups:   groups.List(),
+					GIDs:     gids.List(),
+				},
+				GID: g,
+			})
+			if err != nil {
+				return err
+			}
+			target := filepath.Join(inputDir, "installer", "charts", fmt.Sprintf("kubeform-provider-%s-%s-crds", p, g), rel)
+			return ioutil.WriteFile(target, buf.Bytes(), 0644)
+		})
+		if err != nil {
+			return err
 		}
 	}
+
+	// installer/.generator/hack/scripts
+	root = filepath.Join(inputDir, "installer", ".generator", "hack", "scripts")
+	err = filepath.Walk(root, func(path string, info fs.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		fmt.Println(rel)
+
+		/*
+			.
+			import-crds.sh
+			update-chart-dependencies.sh
+		*/
+
+		if info.IsDir() {
+			return os.MkdirAll(filepath.Join(inputDir, "installer", "hack", "scripts", rel), 0755)
+		}
+
+		tpl := template.Must(template.New("").Funcs(sprig.TxtFuncMap()).ParseFiles(path))
+		buf.Reset()
+		err = tpl.ExecuteTemplate(&buf, filepath.Base(path), providerList)
+		if err != nil {
+			return err
+		}
+		return ioutil.WriteFile(filepath.Join(inputDir, "installer", "hack", "scripts", rel), buf.Bytes(), 0755)
+	})
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
-func allowed(gk schema.GroupKind) bool {
-	if len(allowedGroups) == 0 && len(allowedGKs) == 0 {
-		return true
-	}
-
-	if _, ok := allowedGroups[gk.Group]; ok {
-		return true
-	}
-	if _, ok := allowedGKs[gk]; ok {
-		return true
-	}
-	return false
-}
-
-func processLocation(location string) error {
+func processLocation(location string, store map[schema.GroupKind]map[string]*unstructured.Unstructured) error {
 	u, err := url.Parse(location)
 	if err != nil {
 		return err
@@ -159,7 +438,7 @@ func processLocation(location string) error {
 		if err != nil {
 			return err
 		}
-		return parser.ProcessResources(buf.Bytes(), extractCRD)
+		return parser.ProcessResources(buf.Bytes(), extractCRD(store))
 	}
 
 	fi, err := os.Stat(location)
@@ -167,44 +446,46 @@ func processLocation(location string) error {
 		return err
 	}
 	if fi.IsDir() {
-		return parser.ProcessDir(location, extractCRD)
+		return parser.ProcessDir(location, extractCRD(store))
 	} else {
 		data, err := ioutil.ReadFile(location)
 		if err != nil {
 			return err
 		}
-		return parser.ProcessResources(data, extractCRD)
+		return parser.ProcessResources(data, extractCRD(store))
 	}
 }
 
-func extractCRD(obj *unstructured.Unstructured) error {
-	var def Definition
+func extractCRD(store map[schema.GroupKind]map[string]*unstructured.Unstructured) func(obj *unstructured.Unstructured) error {
+	return func(obj *unstructured.Unstructured) error {
+		var def Definition
 
-	err := meta_util.DecodeObject(obj.Object, &def)
-	if err != nil {
-		return err
+		err := meta_util.DecodeObject(obj.Object, &def)
+		if err != nil {
+			return err
+		}
+
+		gv, err := schema.ParseGroupVersion(def.APIVersion)
+		if err != nil {
+			return err
+		}
+
+		gk := schema.GroupKind{
+			Group: def.Spec.Group,
+			Kind:  def.Spec.Names.Kind,
+		}
+
+		if _, ok := store[gk]; !ok {
+			store[gk] = map[string]*unstructured.Unstructured{}
+		}
+		store[gk][gv.Version] = obj
+
+		return nil
 	}
-
-	gv, err := schema.ParseGroupVersion(def.APIVersion)
-	if err != nil {
-		return err
-	}
-
-	gk := schema.GroupKind{
-		Group: def.Spec.Group,
-		Kind:  def.Spec.Names.Kind,
-	}
-
-	if _, ok := crdstore[gk]; !ok {
-		crdstore[gk] = map[string]*unstructured.Unstructured{}
-	}
-	crdstore[gk][gv.Version] = obj
-
-	return nil
 }
 
-func WriteCRD(dir string, gk schema.GroupKind, version string) ([]byte, string, error) {
-	crdversions, ok := crdstore[gk]
+func WriteCRD(store map[schema.GroupKind]map[string]*unstructured.Unstructured, dir string, gk schema.GroupKind, version string) ([]byte, string, error) {
+	crdversions, ok := store[gk]
 	if !ok {
 		return nil, "", fmt.Errorf("missing crd for %+v", gk)
 	}
