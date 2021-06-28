@@ -40,7 +40,7 @@ import (
 
 func NewCmdSimple() *cobra.Command {
 	var (
-		descriptorDir = "/home/tamal/go/src/kmodules.xyz/resource-metadata/hub/resourcedescriptors/"
+		descriptorDir = "/home/tamal/go/src/kmodules.listing/resource-metadata/hub/resourcedescriptors/"
 		chartDir      = "/home/tamal/go/src/go.bytebuilders.dev/ui-wizards/charts"
 		gvr           schema.GroupVersionResource
 		all           bool
